@@ -1,54 +1,62 @@
 """
-ALPR-обгортка довкола Doubango UltimateALPR-SDK.
-Перетворює кадр BGR ➜ I420 (bytes) та віддає в движок.
+detection.py
+Розпізнавання номерного знаку та атрибутів транспортного засобу
+за допомогою UltimateALPR‑SDK (https://github.com/DoubangoTelecom/ultimateALPR-SDK)
 """
 
-import json
-from pathlib import Path
-
+from __future__ import annotations
 import cv2
+import json
+import numpy as np
 import ultimateAlprSdk
-
+from typing import Tuple
 import config
 
-# ─── Ініціалізація движка (Lazy Singleton) ────────────────────────────────────
-_engine = ultimateAlprSdk.UltAlprSdkEngine()
-if not _engine.isInit():
-    params = {
-        "debug_level": "warning",
-        "charset": "latin",
-        "pyramidal_search_enabled": "true",
-        # додавайте інші параметри за потреби
-    }
-    _engine.init(json.dumps(params), config.ALPR_SDK_LIB_PATH)
+# ініціалізація движка
+_INIT_RES = ultimateAlprSdk.UltAlprSdkEngine_init(json.dumps(config.ALPR_JSON_CONFIG))
+if not _INIT_RES.isOK():
+    raise RuntimeError(f"ALPR init failed: {_INIT_RES.phrase()}")
 
+_IMG_TYPE = ultimateAlprSdk.ULTALPR_SDK_IMAGE_TYPE_RGB24
 
-def recognize_bgr(frame):
-    """
-    Повертає dict із результатами розпізнавання або None, якщо номерів немає.
-    """
-    height, width = frame.shape[:2]
+def _process(frame: np.ndarray) -> dict:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    result = ultimateAlprSdk.UltAlprSdkEngine_process(
+        _IMG_TYPE,
+        rgb.tobytes(),
+        w,
+        h,
+        w * 3,
+        1
+    )
+    if not result.isOK():
+        raise RuntimeError("ALPR process failed: " + result.phrase())
+    return json.loads(result.json())
 
-    # OpenCV → I420 bytes (саме bytes, а не numpy-view — так стабільніше на armv7l)
-    yuv_bytes = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV_I420).tobytes()
-    y_size = width * height
-    uv_size = (width // 2) * (height // 2)
-    y_plane = yuv_bytes[0:y_size]
-    u_plane = yuv_bytes[y_size:y_size + uv_size]
-    v_plane = yuv_bytes[y_size + uv_size:y_size + 2 * uv_size]
-
-    result_json = _engine.process(
-        ultimateAlprSdk.ULTALPR_SDK_IMAGE_TYPE_YUV420P,
-        y_plane, u_plane, v_plane,
-        width, height,
-        0, 0, 0  # strides (0 = packed)
+def detect_plate_and_vehicle(frame: np.ndarray) -> Tuple[str|None, str|None, str|None, str|None]:
+    data = _process(frame)
+    plates = data.get('plates', [])
+    if not plates:
+        return None, None, None, None
+    best = plates[0]
+    plate = best.get('plate')
+    vehicle = best.get('vehicle', {})
+    return (
+        plate or None,
+        vehicle.get('make') or None,
+        vehicle.get('model') or None,
+        vehicle.get('color') or None
     )
 
-    result = json.loads(result_json)
-    return result if result.get("plates") else None
+def detect_vehicle_exit(frame: np.ndarray, min_contour_area: int = 5000) -> bool:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return any(cv2.contourArea(c) > min_contour_area for c in contours)
 
-
-def __del__():
-    """Граційне звільнення ресурсів при завершенні роботи."""
-    if _engine.isInit():
-        _engine.deInit()
+def deinit() -> None:
+    res = ultimateAlprSdk.UltAlprSdkEngine_deInit()
+    if not res.isOK():
+        print("ALPR DeInit failed: " + res.phrase())

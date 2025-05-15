@@ -1,79 +1,76 @@
 """
-Головний скрипт роботи системи. Запускає:
-* MONITOR — відстежує машину біля в’їзду (ультразвук + ALPR)
-* EXIT    — обробляє кнопку/команду виїзду
+main.py
+Точка входу системи керування воротами.
 """
 
-import signal
-import sys
 import threading
 import time
-
 import cv2
 
-import sensors
-from detection import recognize_bgr
+from detection import detect_plate_and_vehicle, detect_vehicle_exit, deinit as alpr_deinit
+from sensors import is_car_passing, cleanup as sensors_cleanup
+from gate import open_gate, close_gate, cleanup as gate_cleanup
+from database import get_allowed, update_allowed, add_unauthorized
+import config
 
-
-CAMERA_ID   = 0         # /dev/video0
-DIST_LIMIT  = 120       # см, ближче — вважаємо «є авто»
-PLATE_SCORE = 0.75      # мінімальна впевненість ALPR
-
+LOOP_DELAY = 0.5
 
 def entry_worker():
-    cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
+    cap = cv2.VideoCapture(config.ENTRY_CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open entry camera {config.ENTRY_CAMERA_INDEX}")
     while True:
-        if sensors.get_distance_cm() > DIST_LIMIT:
-            time.sleep(0.1)
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(LOOP_DELAY)
             continue
-
-        ok, frame = cap.read()
-        if not ok:
-            continue
-
-        result = recognize_bgr(frame)
-        if not result:
-            continue
-
-        plate = result["plates"][0]
-        if plate["score"] < PLATE_SCORE:
-            continue
-
-        text = plate["text"]
-        print(f"[ENTRY] Detected: {text}")
-        sensors.relay_open()
-        # TODO: запис у Google Sheets
-
+        plate, make, model, color = detect_plate_and_vehicle(frame)
+        if plate:
+            allowed = {v['plate'] for v in get_allowed()}
+            if plate in allowed:
+                update_allowed(plate, make or '', model or '', color or '')
+                open_gate()
+                while not is_car_passing():
+                    time.sleep(0.1)
+                while is_car_passing():
+                    time.sleep(0.1)
+                close_gate()
+            else:
+                add_unauthorized(plate, make or '', model or '', color or '')
+        time.sleep(LOOP_DELAY)
 
 def exit_worker():
-    """
-    Спрощений сценарій: відкривати при натисканні 'e' у консолі.
-    Можна замінити на власний сенсор / модуль.
-    """
+    cap = cv2.VideoCapture(config.EXIT_CAMERA_INDEX)
     while True:
-        ch = sys.stdin.read(1)
-        if ch.lower() == "e":
-            sensors.relay_open()
-            print("[EXIT] Manual open requested")
-
+        opened = False
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and detect_vehicle_exit(frame):
+                opened = True
+        if cv2.waitKey(1) & 0xFF == ord('e'):
+            opened = True
+        if opened:
+            open_gate()
+            while not is_car_passing():
+                time.sleep(0.1)
+            while is_car_passing():
+                time.sleep(0.1)
+            close_gate()
+        time.sleep(LOOP_DELAY)
 
 def main():
-    t_entry = threading.Thread(target=entry_worker, daemon=True)
-    t_exit  = threading.Thread(target=exit_worker,  daemon=True)
-    t_entry.start()
-    t_exit.start()
-
-    print("System up. Press Ctrl-C to stop.")
-    signal.pause()
-
-
-if __name__ == "__main__":
     try:
-        main()
+        threading.Thread(target=entry_worker, daemon=True).start()
+        threading.Thread(target=exit_worker, daemon=True).start()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping…")
+        print("Stopping system...")
     finally:
-        sensors.cleanup()
+        sensors_cleanup()
+        gate_cleanup()
+        alpr_deinit()
+        cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
