@@ -1,0 +1,7 @@
+opencv-python-headless==4.10.0.82
+numpy>=1.19.5
+RPi.GPIO==0.7.1
+ultimate-alpr-sdk==3.13.0 ; platform_machine=="armv7l"
+google-api-python-client>=2.126.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
