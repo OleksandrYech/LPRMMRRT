@@ -1,8 +1,0 @@
-picamera2                   # libcamera bindings (pre-installed у RPi OS bookworm)
-opencv-python               # тільки для допоміжної візуалізації/дебагу
-gpiozero                    # зручно працювати з GPIO
-RPi.GPIO                    # залежність gpiozero
-google-auth
-gspread
-oauth2client                # якщо використовуєте стару авторизацію
-pytest
