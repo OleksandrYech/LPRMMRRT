@@ -1,0 +1,13 @@
+[Unit]
+Description=Automatic gate control using ALPR
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/auto-gate
+ExecStart=/usr/bin/python3 -m main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
