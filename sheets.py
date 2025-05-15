@@ -21,7 +21,6 @@ YOUR_SPREADSHEET_ID = "1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4"
 # Назви аркушів та діапазони
 VEHICLES_SHEET_NAME = 'Vehicles' # Припускаємо, що так називається ваш аркуш
 VEHICLES_RANGE = 'A3:B'       # Номери та останній в'їзд
-UNAUTHORIZED_SHEET_NAME = 'Vehicles' # Припускаємо, що так називається ваш аркуш для неавторизованих
 UNAUTHORIZED_RANGE_WRITE = 'D3:E' # Куди писати неавторизовані спроби (починаючи з D3)
 
 # Глобальна змінна для клієнта, щоб уникнути повторної автентифікації
@@ -207,12 +206,12 @@ if __name__ == '__main__':
             print("Не вдалося прочитати дані.")
 
         # Тест пошуку та оновлення (замініть 'AB1234CE' на номер, який є у вашій таблиці)
-        # test_plate_existing = "АА0000АА" # Номер, який ТОЧНО є у вашому списку A3:B
+        # test_plate_existing = "BI2680IB" # Номер, який ТОЧНО є у вашому списку A3:B
         # print(f"\nТест пошуку та оновлення для існуючого номера '{test_plate_existing}':")
         # if find_vehicle_and_update_entry_time(test_plate_existing):
         #     print(f"Успішно оновлено для {test_plate_existing}")
         # else:
-        #     print(f"Не вдалося оновити або знайти {test_plate_existing}")
+        # print(f"Не вдалося оновити або знайти {test_plate_existing}")
 
         # Тест пошуку неіснуючого номера
         # test_plate_non_existing = "XX0000XX"
