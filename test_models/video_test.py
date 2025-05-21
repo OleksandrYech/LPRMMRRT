@@ -191,9 +191,7 @@ def postprocess_yolo_output(outputs_list, original_shape_hw, input_shape_wh,
 
 
 def draw_detections(frame, boxes, confidences, class_ids, class_names_list):
-    # Ця функція все ще потрібна, навіть якщо відображення вимкнено,
-    # оскільки вона готує `frame_with_detections`.
-    # Якщо б малювання було дуже ресурсомістким, можна було б і його зробити умовним.
+
     for i in range(len(boxes)):
         x, y, w, h = boxes[i]
         confidence = confidences[i]
@@ -486,7 +484,6 @@ if __name__ == "__main__":
     parser.add_argument("--frame_skip", type=int, default=0,
                         help="Кількість кадрів, які потрібно пропускати між обробками (0 - не пропускати). N=0 обробляє кожен кадр, N=1 обробляє 1, пропускає 1, обробляє 1 ...).")
     parser.add_argument("--debug", action='store_true', help="Увімкнути детальне логування для налагодження.")
-    # ОПТИМІЗАЦІЯ: Додано аргумент для вимкнення відображення
     parser.add_argument("--no_display", action='store_true',
                         help="Вимкнути відображення відеовікна (для тестів продуктивності або headless режиму).")
 

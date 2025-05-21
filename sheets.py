@@ -1,9 +1,6 @@
 # sheets.py
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials # Старіший варіант, але часто працює
-# Або для новіших версій gspread/google-api-python-client:
-# from google.oauth2.service_account import Credentials
-# from gspread import authorize
+from oauth2client.service_account import ServiceAccountCredentials
 
 import logging
 from datetime import datetime
@@ -13,8 +10,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Константи
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file']
-# Шлях до файлу з обліковими даними, який ви завантажили з Google Cloud Console
-# Розмістіть цей файл в тій же директорії, що і ваші скрипти, або вкажіть повний шлях
 CREDENTIALS_FILE = 'credentials.json'
 YOUR_SPREADSHEET_ID = "1gz5snNdG06sPL0_w2zyWtca3BiAQ7ru8I93LqPVjrC4"
 
@@ -37,10 +32,7 @@ def _get_sheet_client():
             # Використання oauth2client (традиційний спосіб)
             creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, SCOPES)
             SHEET_CLIENT = gspread.authorize(creds)
-            
-            # Альтернатива з google-auth (для новіших версій):
-            # creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-            # SHEET_CLIENT = authorize(creds)
+
             
             logging.info("Successfully connected to Google Sheets API.")
         except FileNotFoundError:
@@ -69,19 +61,11 @@ def read_sheet_data(sheet_title, range_name):
         sheet = client.open_by_key(YOUR_SPREADSHEET_ID).worksheet(VEHICLES_SHEET_NAME)
         
         data = sheet.get_all_values() # Поки що читаємо весь лист, потім можна оптимізувати до range_name
-        # data = sheet.get(range_name) # Якщо потрібен конкретний діапазон
-        
-        # Видаляємо заголовки (перші 2 рядки, оскільки дані з A3)
-        # Це специфічно для 'Vehicles', потрібно узагальнити або передавати кількість рядків-заголовків
         if sheet_title == VEHICLES_SHEET_NAME and len(data) > 2:
              # Повертаємо лише дані з A3:B (стовпці 0 та 1)
             relevant_data = [[row[0], row[1] if len(row) > 1 else ""] for row in data[2:]]
             return relevant_data
         elif sheet_title == UNAUTHORIZED_SHEET_NAME:
-            # Для неавторизованих, якщо є заголовки, їх теж треба врахувати.
-            # Зараз припустимо, що D3:E - це місце для запису, і читати його поки не потрібно
-            # або читати для пошуку, якщо це потрібно.
-            # Поки що повернемо всі дані, якщо читання з цього аркуша знадобиться.
              relevant_data = [[row[3], row[4] if len(row) > 4 else ""] for row in data[2:] if len(row) > 3]
              return relevant_data
         return data # Повертаємо всі дані для інших випадків або якщо логіка заголовків інша
@@ -117,20 +101,14 @@ def find_vehicle_and_update_entry_time(plate_number):
         # Отримуємо всі записи з стовпця А (номери) та В (час)
         
         list_of_lists = sheet.get_all_values()
-        # Перші два рядки - заголовки, тому починаємо з list_of_lists[2]
-        # Нумерація рядків у gspread починається з 1.
-        # Якщо A3, то це 3-й рядок.
+
 
         found = False
         for i, row in enumerate(list_of_lists):
             if i < 2: # Пропускаємо перші два рядки заголовків (A1, A2)
                 continue
             if row and row[0] == plate_number: # Номер в стовпці A (індекс 0)
-                # Знайдено номер, оновлюємо стовпець B (індекс 1)
-                # Нумерація рядків для update_cell починається з 1.
-                # i - це індекс у списку Python, який починається з 0.
-                # Якщо дані починаються з 3-го рядка аркуша, то для першого запису (i=2)
-                # номер рядка в аркуші буде i + 1 = 3.
+
                 sheet_row_index = i + 1
                 current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sheet.update_cell(sheet_row_index, 2, current_datetime) # Стовпець B - це 2-й стовпець

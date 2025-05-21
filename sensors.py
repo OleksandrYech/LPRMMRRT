@@ -1,4 +1,3 @@
-# sensors.py
 from gpiozero import DigitalInputDevice, DistanceSensor
 from gpiozero.pins.pigpio import PiGPIOFactory # Для більш стабільної роботи, особливо з DistanceSensor
 import time
@@ -8,12 +7,6 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__) # Створюємо логгер для цього модуля
 
-# Використання PiGPIOFactory може покращити стабільність, особливо для ШІМ/точних вимірювань
-# Потрібно встановити: sudo apt install pigpiod python3-pigpio
-# та запустити демон: sudo systemctl start pigpiod; sudo systemctl enable pigpiod
-# Якщо ви не хочете використовувати pigpio, можна закоментувати наступні рядки
-# і gpiozero буде використовувати RPi.GPIO або інший доступний pin factory.
-# Однак для DistanceSensor це часто рекомендовано.
 try:
     factory = PiGPIOFactory()
     logger.info("Using PiGPIOFactory for pin control.")

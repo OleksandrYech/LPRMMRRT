@@ -5,10 +5,10 @@ from ultralytics import YOLO
 import os
 
 # --- Налаштування ---
-MODEL_PT_PATH = "/home/mrfir/models/ocr.pt"  # 👈 Замініть на шлях до вашої .pt моделі
-MODEL_ONNX_PATH = "/home/mrfir/models/ocr.onnx"  # 👈 Замініть на шлях до вашої .onnx моделі
-IMAGE_PATH = "/home/mrfir/models/test.png"  # 👈 Замініть на шлях до вашого тестового зображення
-CONFIDENCE_THRESHOLD = 0.12# 👈 Поріг впевненості для врахування детекцій номерних знаків
+MODEL_PT_PATH = "/home/pi/auto-gate/detection/models/ocr.pt"  # шлях до .pt
+MODEL_ONNX_PATH = "/home/pi/auto-gate/detection/models/ocr.onnx"  # шлях до .onnx
+IMAGE_PATH = "/home/pi/auto-gate/test_models/test.png"
+CONFIDENCE_THRESHOLD = 0.12
 
 
 def run_ocr_via_detection_test(model_path, image_path, model_name):
@@ -116,12 +116,7 @@ def run_ocr_via_detection_test(model_path, image_path, model_name):
 
 
 if __name__ == "__main__":
-    # Переконайтеся, що шляхи до моделей та зображення правильні
-    # та файли знаходяться там, де їх очікує скрипт,
-    # або вкажіть повні шляхи.
-    # Зображення IMAGE_PATH має бути вже обрізаним до області номерного знаку.
 
-    # Тестування .pt моделі
     run_ocr_via_detection_test(MODEL_PT_PATH, IMAGE_PATH, "PyTorch (.pt)")
 
     # Тестування .onnx моделі
