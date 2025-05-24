@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ocr_tester.py — CLI-тестер OCR-YOLO моделей (PT / ONNX / TFLite).
+test_license_fix.py
+===================
+
+CLI-тестер OCR-YOLO-моделей (PyTorch, ONNX, TFLite).
 """
 
 from __future__ import annotations
@@ -11,25 +14,27 @@ import cv2, numpy as np
 from ultralytics import YOLO
 import tensorflow as tf
 
-# ------------------ словник номерів (36 класів) ----------------------------
-CLASS_NAMES = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # len == 36
 
-# ------------------ аргументи командного рядка -----------------------------
+# ---------- словник номерних знаків (36 класів) ----------------------------
+CLASS_NAMES = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+# ---------- аргументи командного рядка -------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser("Тестування OCR-YOLO моделей")
-    p.add_argument("--model", action="append", required=True,
-                   help="Шлях до моделі; опцію можна повторювати.")
-    p.add_argument("--image", required=True,
-                   help="Зображення з номерним знаком.")
-    p.add_argument("--input_size", type=int, default=320,
-                   help="Квадратний розмір входу (H=W).")
-    p.add_argument("--conf", type=float, default=0.12,
-                   help="Поріг confidence символів.")
-    p.add_argument("--runs", type=int, default=5,
-                   help="Скільки разів запускати для усереднення часу.")
+    p.add_argument(
+        "-m", "--model", "--path", dest="model_paths",
+        action="append", required=True,
+        help="Шлях до моделі; опцію можна повторювати."
+    )
+    p.add_argument("--image", required=True, help="Зображення з номерним знаком.")
+    p.add_argument("--input_size", type=int, default=320, help="Розмір входу (H=W).")
+    p.add_argument("--conf", type=float, default=0.12, help="Поріг confidence.")
+    p.add_argument("--runs", type=int, default=5, help="Кількість повторів.")
     return p.parse_args()
 
-# ------------------ утиліти -------------------------------------------------
+
+# ---------- допоміжні функції ----------------------------------------------
 def load_class_names(pt_path: str | None) -> List[str]:
     if pt_path:
         try:
@@ -40,8 +45,9 @@ def load_class_names(pt_path: str | None) -> List[str]:
             pass
     return CLASS_NAMES
 
+
 def preprocess_tflite(img, inp_det, img_sz):
-    shape = inp_det[0]["shape"]; dtype = inp_det[0]["dtype"]
+    shape, dtype = inp_det[0]["shape"], inp_det[0]["dtype"]
     nchw = shape[1] == 3
     h = shape[2] if nchw else shape[1] or img_sz
     w = shape[3] if nchw else shape[2] or img_sz
@@ -51,7 +57,7 @@ def preprocess_tflite(img, inp_det, img_sz):
     img = img.astype(np.float32) / 255.0
     if nchw:
         img = img.transpose(2, 0, 1)
-    img = img[None]  # (1,…)
+    img = img[None]
 
     if dtype in (np.uint8, np.int8):
         qp = inp_det[0]["quantization_parameters"]
@@ -62,28 +68,27 @@ def preprocess_tflite(img, inp_det, img_sz):
         img = img.astype(dtype)
     return img
 
-# ------------------ допоміжні функції --------------------------------------
-def order_and_stringify(det):  # det: List[(x, char, conf)]
+
+def dequant(arr, od):
+    if arr.dtype == np.float32:
+        return arr
+    qp = od["quantization_parameters"]
+    scale = qp["scales"]
+    zp = qp["zero_points"]
+    return (arr.astype(np.float32) - zp) * scale
+
+
+def order_and_stringify(det):                     # det: List[(x, char, conf)]
     if not det:
         return "НЕ РОЗПІЗНАНО", 0.0
     det.sort(key=lambda d: d[0])
     chars, confs = zip(*[(c, f) for _, c, f in det])
     return "".join(chars), float(np.mean(confs))
 
-def dequant(arr, od):
-    """Повертає float32 масив незалежно від dtype."""
-    if arr.dtype == np.float32:
-        return arr.astype(np.float32)
-    qp = od["quantization_parameters"]
-    scale = qp["scales"]
-    zp = qp["zero_points"]
-    if scale.size == 0:                      # деякі edge-TPU моделі
-        return arr.astype(np.float32)
-    return (arr.astype(np.float32) - zp) * scale
 
-# ------------------ інференс back-ends --------------------------------------
+# ---------- back-ends --------------------------------------------------------
 def run_pt_or_onnx(path, img, names, thr, runs):
-    m = YOLO(path); _ = m(img, verbose=False, conf=thr)  # прогрів
+    m = YOLO(path); _ = m(img, verbose=False, conf=thr)
     times, last = [], []
     for i in range(runs):
         t0 = time.perf_counter()
@@ -100,37 +105,38 @@ def run_pt_or_onnx(path, img, names, thr, runs):
     plate, c = order_and_stringify(last)
     return plate, c, np.mean(times)
 
-def parse_tflite_out(interp, od, thr, names):
+
+def parse_tflite_out(it, od, thr, names):
     det = []
-    # 4-тензорний формат
+    # 4-тензорний вихід
     if len(od) == 4 and od[0]["shape"].ndim == 3 and od[0]["shape"][-1] == 4:
-        boxes   = dequant(interp.get_tensor(od[0]["index"]), od[0])[0]
-        scores  = dequant(interp.get_tensor(od[1]["index"]), od[1])[0]
-        classes = dequant(interp.get_tensor(od[2]["index"]), od[2])[0]
-        n = int(interp.get_tensor(od[3]["index"])[0])
+        boxes   = dequant(it.get_tensor(od[0]["index"]), od[0])[0]
+        scores  = dequant(it.get_tensor(od[1]["index"]), od[1])[0]
+        classes = dequant(it.get_tensor(od[2]["index"]), od[2])[0]
+        n = int(it.get_tensor(od[3]["index"])[0])
         for j in range(n):
-            conf = float(scores[j]);   cls = int(classes[j])
+            conf = float(scores[j]); cls = int(classes[j])
             if conf < thr or cls >= len(names): continue
-            x1, y1, x2, y2 = boxes[j]; xc = (x1 + x2) / 2.0
+            x1, _, x2, _ = boxes[j]; xc = (x1 + x2) / 2.0
             det.append((xc, names[cls], conf))
         return det
-    # 1-тензорний формат
-    raw = dequant(interp.get_tensor(od[0]["index"]), od[0])
+    # 1-тензорний вихід
+    raw = dequant(it.get_tensor(od[0]["index"]), od[0])
     if raw.ndim == 3 and raw.shape[2] >= 6:
-        for x1, y1, x2, y2, conf, cls in raw[0]:
+        for x1, _, x2, _, conf, cls in raw[0]:
             conf = float(conf); cls = int(cls)
             if conf < thr or cls >= len(names): continue
             xc = (x1 + x2) / 2.0
             det.append((xc, names[cls], conf))
     return det
 
+
 def run_tflite(path, img, names, thr, runs, img_sz):
     it = tf.lite.Interpreter(model_path=path); it.allocate_tensors()
     inp_det, out_det = it.get_input_details(), it.get_output_details()
     inp = preprocess_tflite(img, inp_det, img_sz)
-
+    it.set_tensor(inp_det[0]["index"], inp); it.invoke()     # прогрів
     times, last = [], []
-    it.set_tensor(inp_det[0]["index"], inp); it.invoke()  # прогрів
     for i in range(runs):
         t0 = time.perf_counter()
         it.set_tensor(inp_det[0]["index"], inp); it.invoke()
@@ -140,16 +146,19 @@ def run_tflite(path, img, names, thr, runs, img_sz):
     plate, c = order_and_stringify(last)
     return plate, c, np.mean(times)
 
-# ------------------ головна логіка ------------------------------------------
+
+# ---------- main -------------------------------------------------------------
 if __name__ == "__main__":
     args = parse_args()
 
-    # перевірки
+    # перевірка файлів
     for p in args.model_paths + [args.image]:
-        if not os.path.exists(p): sys.exit(f"Файл не знайдено: {p}")
+        if not os.path.exists(p):
+            sys.exit(f"Файл не знайдено: {p}")
 
     img = cv2.imread(args.image)
-    if img is None: sys.exit(f"Не вдалося відкрити {args.image}")
+    if img is None:
+        sys.exit(f"Не вдалося відкрити {args.image}")
 
     pt_first = next((p for p in args.model_paths if p.endswith(".pt")), None)
     names = load_class_names(pt_first)
