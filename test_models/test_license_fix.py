@@ -110,117 +110,75 @@ def run_pt_or_onnx(path, img, names, thr, runs):
 import math
 import numpy as np
 
-def parse_tflite_out(interp, out_det, thr: float, names):
+def parse_tflite_out(interp, out_det, thr: float, names, x_tol: float = 6.0):
     """
-    Парсить вихідні тензори TFLite-моделі YOLO та повертає
-    список детекцій у форматі:
-        [(x_center, char, confidence), ...].
-
-    Підтримує три найпоширеніші формати експорту:
-
-    1) **4-тензорний** із вбудованим NMS
-       └─ boxes  : (1,N,4)  — [x1,y1,x2,y2]  (у пікселях)
-       └─ scores : (1,N)    — conf
-       └─ classes: (1,N)    — class_id
-       └─ count  : (1,)     — фактична кількість детекцій N
-
-    2) **1-тензорний «N×6»**
-       └─ [x1, y1, x2, y2, conf, class_id]
-       (координати можуть бути нормалізовані; для сортування
-       потрібен лише x-центр, тому масштабування опускаємо).
-
-    3) **1-тензорний «N×(5+nc)»** (сирий YOLO-вихід)
-       └─ [cx, cy, w, h, obj_logit, cls_logit0 … cls_logit{nc-1}]
-       (логіти → ймовірності через sigmoid; conf = obj * cls_prob).
-
-    Параметри
-    ---------
-    interp : tf.lite.Interpreter
-        Активний інтерпретатор із виконаним `invoke()`.
-    out_det : list[dict]
-        Список словників із `shape`, `index`, `quantization_parameters`.
-    thr : float
-        Поріг confidence (у діапазоні 0‒1) для фільтрації символів.
-    names : Sequence[str]
-        Список імен класів (довжина == nc).
-
-    Повертає
-    --------
-    list[tuple[float, str, float]]
-        Відсортовані за x_center детекції символів.
+    Повертає [(x_center, char, conf), …] після фільтрації NMS-1D.
+    x_tol — мін. відстань між центрами різних символів у пікселях
+            (для входу 320 звично 5–8 px).
     """
+
     def dequant(arr: np.ndarray, od: dict) -> np.ndarray:
-        """Переводить INT8/UINT8 → float32; float32 лишає без змін."""
         if arr.dtype == np.float32:
-            return arr.astype(np.float32)
+            return arr
         qp = od["quantization_parameters"]
-        scales = qp["scales"]
-        zero_pts = qp["zero_points"]
-        if scales.size == 0:                         # EdgeTPU edge-case
-            return arr.astype(np.float32)
-        return (arr.astype(np.float32) - zero_pts) * scales
+        scales = qp["scales"];  zero = qp["zero_points"]
+        return (arr.astype(np.float32) - zero) * scales
 
-    detections = []
+    det = []               # сирі детекції
+    keep = []              # після NMS-1D
 
-    # ---------- 1. 4-тензорний вихід ---------------------------------------
-    if (
-        len(out_det) == 4
-        and out_det[0]["shape"].ndim == 3
-        and out_det[0]["shape"][-1] == 4
-    ):
+    # --------- формат 4-тензорний (готовий NMS) ---------------------------
+    if len(out_det) == 4 and out_det[0]["shape"][-1] == 4:
         boxes   = dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])[0]
         scores  = dequant(interp.get_tensor(out_det[1]["index"]), out_det[1])[0]
         classes = dequant(interp.get_tensor(out_det[2]["index"]), out_det[2])[0]
-        n_det   = int(interp.get_tensor(out_det[3]["index"])[0])
+        n = int(interp.get_tensor(out_det[3]["index"])[0])
 
-        for j in range(n_det):
+        for j in range(n):
             conf = float(scores[j])
-            if conf < thr:
-                continue
-            cls_id = int(classes[j])
-            if cls_id >= len(names):
-                continue
-            x1, _, x2, _ = boxes[j]
-            x_center = (x1 + x2) / 2.0
-            detections.append((x_center, names[cls_id], conf))
-        return detections
+            if conf < thr:                 continue
+            cid = int(classes[j])
+            if cid >= len(names):          continue
+            x1, _, x2, _ = boxes[j];  xc = (x1 + x2) / 2.0
+            det.append((xc, names[cid], conf))
 
-    # ---------- 2. Один великий тензор -------------------------------------
-    raw = dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])
-    if raw.ndim != 3:
-        return detections                       # невідомий формат
+    # --------- формат один тензор -----------------------------------------
+    else:
+        raw = dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])
+        if raw.ndim != 3:  return []
 
-    attrs = raw.shape[2]
+        attrs = raw.shape[2]
 
-    # ---- 2.a «N×6» --------------------------------------------------------
-    if attrs == 6:
-        for x1, _, x2, _, conf, cls_id in raw[0]:
-            conf = float(conf)
-            cls_id = int(cls_id)
-            if conf < thr or cls_id >= len(names):
-                continue
-            x_center = (x1 + x2) / 2.0
-            detections.append((x_center, names[cls_id], conf))
-        return detections
+        # ― 2.a «N×6» -------------------------------------------------------
+        if attrs == 6:
+            for x1, _, x2, _, conf, cid in raw[0]:
+                conf = float(conf);  cid = int(cid)
+                if conf < thr or cid >= len(names):  continue
+                xc = (x1 + x2) / 2.0
+                det.append((xc, names[cid], conf))
 
-    # ---- 2.b «N×(5+nc)» сирий YOLO ---------------------------------------
-    #  [cx, cy, w, h, obj_logit, cls_logit0 …]
-    if attrs >= 5 + len(names):
-        sigmoid = lambda x: 1.0 / (1.0 + math.exp(-x))
-        for row in raw[0]:
-            obj_conf = sigmoid(float(row[4]))          # obj_logit → prob
-            if obj_conf < 1e-6:                        # швидкий пропуск
-                continue
-            cls_logits = row[5 : 5 + len(names)]
-            cls_id = int(np.argmax(cls_logits))
-            cls_prob = sigmoid(float(cls_logits[cls_id]))
-            conf = obj_conf * cls_prob
-            if conf < thr:
-                continue
-            x_center = float(row[0])                   # cx уже нормалізовано
-            detections.append((x_center, names[cls_id], conf))
-    # ----------------------------------------------------------------------
-    return detections
+        # ― 2.b «N×(5+nc)» сирий YOLO --------------------------------------
+        elif attrs >= 5 + len(names):
+            sigm = lambda x: 1.0 / (1.0 + math.exp(-x))
+            for row in raw[0]:
+                obj = sigm(float(row[4]))
+                if obj < 1e-6:        continue
+                cls_logits = row[5 : 5 + len(names)]
+                cid = int(np.argmax(cls_logits))
+                cls_prob = sigm(float(cls_logits[cid]))
+                conf = obj * cls_prob
+                if conf < thr:        continue
+                xc = float(row[0])    # cx
+                det.append((xc, names[cid], conf))
+
+    # ---------------- 1-D NMS уздовж X-центру ------------------------------
+    # сортуємо за впевненістю, залишаємо кращий бокс поблизу кожного xc
+    det.sort(key=lambda d: d[2], reverse=True)
+    for xc, ch, cf in det:
+        if all(abs(xc - k[0]) > x_tol for k in keep):
+            keep.append((xc, ch, cf))
+
+    return keep
 
 
 def run_tflite(path, img, names, thr, runs, img_sz):
