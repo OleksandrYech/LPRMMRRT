@@ -110,24 +110,26 @@ def run_pt_or_onnx(path, img, names, thr, runs):
 import math
 import numpy as np
 
-def parse_tflite_out(interp, out_det, thr: float, names, x_tol: float = 6.0):
+import math
+import numpy as np
+
+def parse_tflite_out(interp, out_det, thr: float, names, img_w: int = 320,
+                     x_tol_px: float = 6.0):
     """
-    Повертає [(x_center, char, conf), …] після фільтрації NMS-1D.
-    x_tol — мін. відстань між центрами різних символів у пікселях
-            (для входу 320 звично 5–8 px).
+    Повертає [(x_center_px, char, conf), …] із коректним масштабуванням
+    та 1-D NMS по осі X.  `img_w` — ширина входу моделі (звично 320).
     """
 
     def dequant(arr: np.ndarray, od: dict) -> np.ndarray:
         if arr.dtype == np.float32:
             return arr
         qp = od["quantization_parameters"]
-        scales = qp["scales"];  zero = qp["zero_points"]
-        return (arr.astype(np.float32) - zero) * scales
+        return (arr.astype(np.float32) - qp["zero_points"]) * qp["scales"]
 
-    det = []               # сирі детекції
-    keep = []              # після NMS-1D
+    det_raw = []                      # сирі детекції
+    keep = []                         # після NMS-1D
 
-    # --------- формат 4-тензорний (готовий NMS) ---------------------------
+    # ---------- 1) 4-тензорний вихід --------------------------------------
     if len(out_det) == 4 and out_det[0]["shape"][-1] == 4:
         boxes   = dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])[0]
         scores  = dequant(interp.get_tensor(out_det[1]["index"]), out_det[1])[0]
@@ -136,50 +138,56 @@ def parse_tflite_out(interp, out_det, thr: float, names, x_tol: float = 6.0):
 
         for j in range(n):
             conf = float(scores[j])
-            if conf < thr:                 continue
-            cid = int(classes[j])
-            if cid >= len(names):          continue
-            x1, _, x2, _ = boxes[j];  xc = (x1 + x2) / 2.0
-            det.append((xc, names[cid], conf))
+            if conf < thr:
+                continue
+            cls = int(classes[j])
+            if cls >= len(names):
+                continue
+            x1, _, x2, _ = boxes[j]
+            xc_px = (x1 + x2) / 2.0              # уже у пікселях
+            det_raw.append((xc_px, names[cls], conf))
 
-    # --------- формат один тензор -----------------------------------------
+    # ---------- 2) один великий тензор ------------------------------------
     else:
         raw = dequant(interp.get_tensor(out_det[0]["index"]), out_det[0])
-        if raw.ndim != 3:  return []
+        if raw.ndim != 3:
+            return []
 
         attrs = raw.shape[2]
 
-        # ― 2.a «N×6» -------------------------------------------------------
+        # ― 2.a «N×6» ------------------------------------------------------
         if attrs == 6:
-            for x1, _, x2, _, conf, cid in raw[0]:
-                conf = float(conf);  cid = int(cid)
-                if conf < thr or cid >= len(names):  continue
-                xc = (x1 + x2) / 2.0
-                det.append((xc, names[cid], conf))
+            for x1, _, x2, _, conf, cls in raw[0]:
+                conf = float(conf); cls = int(cls)
+                if conf < thr or cls >= len(names):
+                    continue
+                xc_px = (x1 + x2) / 2.0          # у пікселях
+                det_raw.append((xc_px, names[cls], conf))
 
-        # ― 2.b «N×(5+nc)» сирий YOLO --------------------------------------
+        # ― 2.b «N×(5+nc)» сирий YOLO -------------------------------------
         elif attrs >= 5 + len(names):
             sigm = lambda x: 1.0 / (1.0 + math.exp(-x))
             for row in raw[0]:
                 obj = sigm(float(row[4]))
-                if obj < 1e-6:        continue
+                if obj < 1e-6:
+                    continue
                 cls_logits = row[5 : 5 + len(names)]
-                cid = int(np.argmax(cls_logits))
-                cls_prob = sigm(float(cls_logits[cid]))
+                cls = int(np.argmax(cls_logits))
+                cls_prob = sigm(float(cls_logits[cls]))
                 conf = obj * cls_prob
-                if conf < thr:        continue
-                xc = float(row[0])    # cx
-                det.append((xc, names[cid], conf))
+                if conf < thr or cls >= len(names):
+                    continue
+                cx_norm = float(row[0])          # 0-1
+                xc_px = cx_norm * img_w          # → пікселі!
+                det_raw.append((xc_px, names[cls], conf))
 
-    # ---------------- 1-D NMS уздовж X-центру ------------------------------
-    # сортуємо за впевненістю, залишаємо кращий бокс поблизу кожного xc
-    det.sort(key=lambda d: d[2], reverse=True)
-    for xc, ch, cf in det:
-        if all(abs(xc - k[0]) > x_tol for k in keep):
+    # ---------- 1-D NMS уздовж X-центру -----------------------------------
+    det_raw.sort(key=lambda d: d[2], reverse=True)        # по conf
+    for xc, ch, cf in det_raw:
+        if all(abs(xc - k[0]) > x_tol_px for k in keep):
             keep.append((xc, ch, cf))
 
     return keep
-
 
 def run_tflite(path, img, names, thr, runs, img_sz):
     it = tf.lite.Interpreter(model_path=path); it.allocate_tensors()
