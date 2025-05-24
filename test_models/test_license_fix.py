@@ -107,29 +107,64 @@ def run_pt_or_onnx(path, img, names, thr, runs):
 
 
 def parse_tflite_out(it, od, thr, names):
+    """
+    Повертає список (x_center, char, conf) з урахуванням трьох форматів:
+    1) 4-тензорний (boxes/scores/classes/count)
+    2) 1-тензорний «N×6»  (x1 y1 x2 y2 conf cls)
+    3) 1-тензорний «N×(5+nc)»  (cx cy w h obj_conf cls_probs…)
+    """
     det = []
-    # 4-тензорний вихід
-    if len(od) == 4 and od[0]["shape"].ndim == 3 and od[0]["shape"][-1] == 4:
-        boxes   = dequant(it.get_tensor(od[0]["index"]), od[0])[0]
-        scores  = dequant(it.get_tensor(od[1]["index"]), od[1])[0]
-        classes = dequant(it.get_tensor(od[2]["index"]), od[2])[0]
+
+    # --------- формат 1: 4-тензорний з вбудованим NMS ----------------------
+    if len(od) == 4 and od[0]["shape"][-1] == 4:
+        boxes   = dequant(it.get_tensor(od[0]["index"]), od[0])[0]  # (N,4)
+        scores  = dequant(it.get_tensor(od[1]["index"]), od[1])[0]  # (N,)
+        classes = dequant(it.get_tensor(od[2]["index"]), od[2])[0]  # (N,)
         n = int(it.get_tensor(od[3]["index"])[0])
         for j in range(n):
-            conf = float(scores[j]); cls = int(classes[j])
-            if conf < thr or cls >= len(names): continue
-            x1, _, x2, _ = boxes[j]; xc = (x1 + x2) / 2.0
+            conf = float(scores[j])
+            if conf < thr:     continue
+            cls = int(classes[j])
+            if cls >= len(names): continue
+            x1, _, x2, _ = boxes[j]
+            xc = (x1 + x2) / 2.0
             det.append((xc, names[cls], conf))
         return det
-    # 1-тензорний вихід
-    raw = dequant(it.get_tensor(od[0]["index"]), od[0])
-    if raw.ndim == 3 and raw.shape[2] >= 6:
+
+    # --------- формат 2 або 3: один великий тензор ------------------------
+    raw = dequant(it.get_tensor(od[0]["index"]), od[0])  # (1,N,A)
+    if raw.ndim != 3:
+        return det
+    attrs = raw.shape[2]
+
+    # ――― 2.a «N×6»  -------------------------------------------------------
+    if attrs == 6:
         for x1, _, x2, _, conf, cls in raw[0]:
             conf = float(conf); cls = int(cls)
             if conf < thr or cls >= len(names): continue
             xc = (x1 + x2) / 2.0
             det.append((xc, names[cls], conf))
-    return det
+        return det
 
+    # ――― 2.b «N×(5+nc)» (сирий YOLO)  -------------------------------------
+    #   [0:4]=cx,cy,w,h   4=obj_conf   5: = class_probs
+    if attrs >= 5 + len(names):
+        for row in raw[0]:
+            obj_conf = float(row[4])
+            if obj_conf < 1e-6:    # швидкий пропуск «порожніх»
+                continue
+            cls_probs = row[5 : 5 + len(names)]
+            cls_id = int(np.argmax(cls_probs))
+            cls_prob = float(cls_probs[cls_id])
+            conf = obj_conf * cls_prob
+            if conf < thr:         # застосовуємо той самий поріг
+                continue
+            if cls_id >= len(names):
+                continue
+            cx, cy, w, h = row[:4]
+            xc = float(cx)               # центру достатньо для сортування
+            det.append((xc, names[cls_id], conf))
+    return det
 
 def run_tflite(path, img, names, thr, runs, img_sz):
     it = tf.lite.Interpreter(model_path=path); it.allocate_tensors()
