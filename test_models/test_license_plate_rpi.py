@@ -1,332 +1,252 @@
-import cv2
+#!/usr/bin/env python3
+"""
+ocr_tester.py
+
+Зручний CLI-скрипт для порівняння трьох форматів моделей OCR-YOLO
+(Pytorch *.pt, ONNX *.onnx, TFLite *.tflite INT8) на одному зображенні.
+
+Запуск:
+    python ocr_tester.py --image /path/to/img.png \
+                         --model /path/to/ocr.pt \
+                         --model /path/to/ocr.onnx \
+                         --model /path/to/ocr.tflite \
+                         --input_size 320 \
+                         --conf 0.12 \
+                         --runs 5
+"""
+
+import argparse
+import sys
+import os
 import time
+from typing import List, Tuple
+
+import cv2
 import numpy as np
 from ultralytics import YOLO
-import os
-import tensorflow as tf  # Додано для TFLite
+import tensorflow as tf
 
-# --- Налаштування ---
-MODEL_PT_PATH = "/home/pi/auto-gate/detection/models/ocr.pt"  # шлях до .pt
-MODEL_ONNX_PATH = "/home/pi/auto-gate/detection/models/ocr.onnx"  # шлях до .onnx
-# Вкажіть правильний шлях до вашої квантованої INT8 .tflite моделі
-MODEL_TFLITE_INT8_PATH = "/home/pi/auto-gate/detection/models/ocr.tflite"  # Приклад шляху
-IMAGE_PATH = "/home/pi/auto-gate/test_models/test.png"
-CONFIDENCE_THRESHOLD = 0.12
+# ------------------------------- CLI -----------------------------------------
 
 
-def preprocess_image_for_tflite(img_bgr, input_details):
+def parse_args() -> argparse.Namespace:
+    """Парсинг аргументів командного рядка."""
+    p = argparse.ArgumentParser(
+        description="Тест OCR-моделей YOLO у форматах PyTorch / ONNX / TFLite"
+    )
+    p.add_argument(
+        "--model",
+        required=True,
+        action="append",
+        dest="model_paths",
+        help="Шлях до моделі. Параметр повторюється для кожної моделі.",
+    )
+    p.add_argument("--image", required=True, help="Шлях до зображення з номером.")
+    p.add_argument(
+        "--input_size",
+        type=int,
+        default=320,
+        help="Розмір (H=W) на вході моделі. За замовч. 320.",
+    )
+    p.add_argument(
+        "--conf", type=float, default=0.12, help="Поріг confidence для символів."
+    )
+    p.add_argument(
+        "--runs", type=int, default=5, help="Кількість повторів для усереднення часу."
+    )
+    return p.parse_args()
+
+
+# ------------------------------ Utils ----------------------------------------
+
+
+def load_class_names(pt_path: str) -> List[str]:
     """
-    Перед обробка зображення для TFLite моделі.
-    Включає зміну розміру, конвертацію кольору, нормалізацію та квантування (якщо потрібно).
+    Читає імена класів із *.pt-моделі Ultralytics.
+    Потрібно для TFLite/ONNX, де names не зберігаються.
     """
-    # Очікувана форма та тип даних з моделі TFLite
-    # Зазвичай input_details[0]['shape'] це [1, height, width, 3] (NHWC) для TFLite
-    # або [1, 3, height, width] (NCHW)
-    input_shape = input_details[0]['shape']
-    input_dtype = input_details[0]['dtype']
+    try:
+        model_pt = YOLO(pt_path)
+        if hasattr(model_pt, "names") and model_pt.names:
+            return model_pt.names
+    except Exception:
+        pass
+    sys.exit(
+        f"Не вдалося отримати імена класів із {pt_path}. "
+        "Запустіть зі своїм .pt-файлом або задайте class_names вручну."
+    )
 
-    # Визначаємо цільові розміри та формат каналів (NHWC чи NCHW)
-    is_nchw = input_shape[1] == 3 and input_shape[3] != 3  # Грубе припущення
-    if is_nchw:  # NCHW
-        target_height = input_shape[2]
-        target_width = input_shape[3]
-    else:  # NHWC
-        target_height = input_shape[1]
-        target_width = input_shape[2]
 
+def preprocess_tflite(
+    img_bgr: np.ndarray, input_details: List[dict], img_sz: int
+) -> np.ndarray:
+    """
+    Приводить зображення до формату TFLite-моделі, підтримуючи NHWC та NCHW,
+    float32 / int8 / uint8.
+    """
+    # Очікуваний Shape
+    in_shape = input_details[0]["shape"]
+    in_dtype = input_details[0]["dtype"]
+
+    # Визначаємо порядок каналів
+    is_nchw = len(in_shape) == 4 and in_shape[1] == 3
+    target_h = in_shape[2] if is_nchw else in_shape[1]
+    target_w = in_shape[3] if is_nchw else in_shape[2]
+
+    # Resize + RGB
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (target_width, target_height))
+    img_resized = cv2.resize(img_rgb, (target_w, target_h))
 
-    # Нормалізація до [0, 1]
-    input_data_float32 = img_resized.astype(np.float32) / 255.0
-
+    # Нормалізація 0‒1
+    img_f32 = img_resized.astype(np.float32) / 255.0
     if is_nchw:
-        # HWC to CHW
-        input_data_float32 = np.transpose(input_data_float32, (2, 0, 1))
+        img_f32 = np.transpose(img_f32, (2, 0, 1))  # HWC→CHW
 
-    # Додавання осі батчу
-    input_data_float32 = np.expand_dims(input_data_float32, axis=0)  # Форма (1, H, W, C) або (1, C, H, W)
+    img_f32 = np.expand_dims(img_f32, 0)  # (1, …)
 
-    # Квантування, якщо модель очікує INT8/UINT8 на вході
-    if input_dtype == np.int8 or input_dtype == np.uint8:
-        quant_params = input_details[0]['quantization_parameters']
-        scale = quant_params['scales'][0]
-        zero_point = quant_params['zero_points'][0]
-        input_tensor = (input_data_float32 / scale) + zero_point
-        input_tensor = input_tensor.astype(input_dtype)
-    else:  # Якщо модель очікує float32
-        input_tensor = input_data_float32.astype(input_dtype)
-
-    return input_tensor
+    # Квантування при потребі
+    if in_dtype in (np.uint8, np.int8):
+        scale = input_details[0]["quantization_parameters"]["scales"][0]
+        zero_pt = input_details[0]["quantization_parameters"]["zero_points"][0]
+        img_q = (img_f32 / scale + zero_pt).astype(in_dtype)
+        return img_q
+    return img_f32.astype(in_dtype)
 
 
-def run_ocr_via_detection_test(model_path, image_path, model_name):
+def order_and_stringify(
+    detections: List[Tuple[float, str, float]]
+) -> Tuple[str, float]:
     """
-    Завантажує модель (.pt або .onnx через YOLO), виконує розпізнавання символів,
-    збирає їх у рядок та виводить результати.
+    Сортує символи за координатою X та формує строку з номером.
+    Повертає (рядок, середня_впевненість).
     """
-    print(f"\n--- Тестування моделі: {model_name} ({model_path}) ---")
-
-    if not os.path.exists(model_path):
-        print(f"ПОМИЛКА: Файл моделі не знайдено: {model_path}")
-        return
-    if not os.path.exists(image_path):
-        print(f"ПОМИЛКА: Файл зображення не знайдено: {image_path}")
-        return
-
-    try:
-        # YOLO() може завантажувати .pt та .onnx (якщо onnxruntime встановлено)
-        model = YOLO(model_path)
-        print("Модель успішно завантажена.")
-        if not hasattr(model, 'names') or not model.names:
-            print("ПОПЕРЕДЖЕННЯ: У моделі відсутні імена класів (model.names). "
-                  "Результат розпізнавання символів може бути некоректним.")
-    except Exception as e:
-        print(f"Помилка завантаження моделі {model_path}: {e}")
-        return
-
-    try:
-        img_bgr = cv2.imread(image_path)
-        if img_bgr is None:
-            print(f"Помилка завантаження зображення {image_path}")
-            return
-        print(f"Зображення {image_path} успішно завантажено (для OCR).")
-
-        # Прогрів моделі
-        _ = model(img_bgr, verbose=False, conf=CONFIDENCE_THRESHOLD)
-
-        num_runs = 5
-        inference_times = []
-
-        recognized_plate_string_last_run = "НЕ РОЗПІЗНАНО"
-        avg_char_confidence_last_run = 0.0
-        char_details_last_run = []
-
-        print(f"Запуск розпізнавання символів ({num_runs} разів)...")
-        for i in range(num_runs):
-            start_time = time.perf_counter()
-            results_list = model(img_bgr, verbose=False, conf=CONFIDENCE_THRESHOLD)
-            end_time = time.perf_counter()
-            inference_times.append(end_time - start_time)
-
-            if i == num_runs - 1 and results_list:
-                results = results_list[0]  # Перший результат з батчу
-                detected_characters_info = []
-
-                if results.boxes:
-                    for box in results.boxes:
-                        confidence = box.conf.item()
-                        cls_id = int(box.cls.item())
-
-                        character_str = "UNK"
-                        if model.names and cls_id < len(model.names):
-                            character_str = model.names[cls_id]
-                        else:
-                            print(f"ПОПЕРЕДЖЕННЯ: Не знайдено ім'я для класу ID {cls_id}. Використано 'UNK'.")
-
-                        x_center = box.xywh.squeeze().tolist()[0]
-
-                        detected_characters_info.append({
-                            "x": x_center,
-                            "char": character_str,
-                            "conf": confidence
-                        })
-
-                detected_characters_info.sort(key=lambda item: item["x"])
-                recognized_plate_string_last_run = "".join([item["char"] for item in detected_characters_info])
-                char_confidences = [item["conf"] for item in detected_characters_info]
-
-                if char_confidences:
-                    avg_char_confidence_last_run = np.mean(char_confidences)
-                    char_details_last_run = [f"{item['char']}({item['conf']:.2f})" for item in detected_characters_info]
-
-        avg_inference_time = np.mean(inference_times)
-        print(f"\nРезультати для {model_name}:")
-        print(f"  Середній час розпізнавання: {avg_inference_time:.4f} секунд")
-
-        if recognized_plate_string_last_run != "НЕ РОЗПІЗНАНО" and char_details_last_run:
-            print(f"  Розпізнаний номерний знак (останній запуск): '{recognized_plate_string_last_run}'")
-            print(f"  Середня впевненість символів (останній запуск): {avg_char_confidence_last_run:.4f}")
-        else:
-            print(f"  Символи не були розпізнані (поріг: {CONFIDENCE_THRESHOLD}).")
-
-    except Exception as e:
-        print(f"Помилка під час розпізнавання моделлю {model_path}: {e}")
-        import traceback
-        traceback.print_exc()
+    if not detections:
+        return "НЕ РОЗПІЗНАНО", 0.0
+    detections.sort(key=lambda d: d[0])  # за x
+    chars = [d[1] for d in detections]
+    confs = [d[2] for d in detections]
+    return "".join(chars), float(np.mean(confs))
 
 
-def run_tflite_ocr_test(model_path, image_path, model_name, class_names):
-    """
-    Завантажує модель TFLite, виконує розпізнавання символів на зображенні,
-    збирає їх у рядок та виводить результати.
-    """
-    print(f"\n--- Тестування моделі: {model_name} ({model_path}) ---")
+# ---------------------------- Inference back-ends -----------------------------
 
-    if not class_names:
-        print("ПОМИЛКА: Список імен класів не надано для TFLite моделі.")
-        return
-    if not os.path.exists(model_path):
-        print(f"ПОМИЛКА: Файл моделі TFLite не знайдено: {model_path}")
-        return
-    if not os.path.exists(image_path):
-        print(f"ПОМИЛКА: Файл зображення не знайдено: {image_path}")
-        return
 
-    try:
-        interpreter = tf.lite.Interpreter(model_path=model_path)
-        interpreter.allocate_tensors()
-        input_details = interpreter.get_input_details()
-        output_details = interpreter.get_output_details()
-        print("Модель TFLite успішно завантажена.")
-        # print("Input details:", input_details) # Для відладки
-        # print("Output details:", output_details) # Для відладки
+def run_pt_or_onnx(
+    model_path: str,
+    img_bgr: np.ndarray,
+    class_names: List[str],
+    conf_thr: float,
+    runs: int,
+) -> Tuple[str, float, float]:
+    """Запуск *.pt або *.onnx через Ultralytics."""
+    model = YOLO(model_path)
+    times, last_detections = [], []
 
-    except Exception as e:
-        print(f"Помилка завантаження моделі TFLite {model_path}: {e}")
-        return
+    # Заздалегідь один прогрів
+    _ = model(img_bgr, verbose=False, conf=conf_thr)
 
-    try:
-        img_bgr = cv2.imread(image_path)
-        if img_bgr is None:
-            print(f"Помилка завантаження зображення {image_path}")
-            return
-        print(f"Зображення {image_path} успішно завантажено (для OCR).")
+    for i in range(runs):
+        t0 = time.perf_counter()
+        res = model(img_bgr, verbose=False, conf=conf_thr)[0]
+        times.append(time.perf_counter() - t0)
 
-        # Перед обробка зображення для TFLite
-        input_tensor = preprocess_image_for_tflite(img_bgr, input_details)
+        if i == runs - 1 and res.boxes:
+            for box in res.boxes:
+                cls_id = int(box.cls)
+                conf = float(box.conf)
+                char = (
+                    class_names[cls_id] if cls_id < len(class_names) else "UNK"
+                )
+                xc = float(box.xywh[0])
+                last_detections.append((xc, char, conf))
 
-        # Прогрів моделі
-        interpreter.set_tensor(input_details[0]['index'], input_tensor)
+    plate_str, avg_conf = order_and_stringify(last_detections)
+    return plate_str, avg_conf, float(np.mean(times))
+
+
+def run_tflite(
+    model_path: str,
+    img_bgr: np.ndarray,
+    class_names: List[str],
+    conf_thr: float,
+    runs: int,
+) -> Tuple[str, float, float]:
+    """Запуск *.tflite INT8 з Ultralytics-експортом (NMS всередині)."""
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    input_details, output_details = interpreter.get_input_details(), interpreter.get_output_details()
+
+    inp = preprocess_tflite(img_bgr, input_details, img_sz=args.input_size)
+
+    times, last_detections = [], []
+    # Прогрів
+    interpreter.set_tensor(input_details[0]["index"], inp)
+    interpreter.invoke()
+
+    for i in range(runs):
+        t0 = time.perf_counter()
+        interpreter.set_tensor(input_details[0]["index"], inp)
         interpreter.invoke()
-        _ = interpreter.get_tensor(output_details[0]['index'])  # Отримати результат, щоб завершити прогрів
+        raw = interpreter.get_tensor(output_details[0]["index"])  # [1,N,6]
+        times.append(time.perf_counter() - t0)
 
-        num_runs = 5
-        inference_times = []
-        recognized_plate_string_last_run = "НЕ РОЗПІЗНАНО"
-        avg_char_confidence_last_run = 0.0
-        char_details_last_run = []
+        if i == runs - 1 and raw.ndim == 3 and raw.shape[2] >= 6:
+            for x1, y1, x2, y2, conf, cls in raw[0]:
+                if conf < conf_thr:
+                    continue
+                cls_id = int(cls)
+                char = class_names[cls_id] if cls_id < len(class_names) else "UNK"
+                x_center = (x1 + x2) / 2.0  # Уже у пікселях (Ultralytics export)
+                last_detections.append((x_center, char, float(conf)))
 
-        # Отримуємо розміри оригінального зображення для масштабування рамок (якщо потрібно)
-        original_height, original_width = img_bgr.shape[:2]
+    plate_str, avg_conf = order_and_stringify(last_detections)
+    return plate_str, avg_conf, float(np.mean(times))
 
-        # Отримуємо розміри входу моделі для денормалізації координат, якщо вони нормалізовані моделлю
-        model_input_shape = input_details[0]['shape']
-        # Припускаємо NHWC або NCHW
-        if model_input_shape[1] == 3 and len(model_input_shape) == 4:  # NCHW
-            model_input_height = model_input_shape[2]
-            model_input_width = model_input_shape[3]
-        elif model_input_shape[3] == 3 and len(model_input_shape) == 4:  # NHWC
-            model_input_height = model_input_shape[1]
-            model_input_width = model_input_shape[2]
-        else:  # Невідомий або непідтримуваний формат
-            print(
-                f"ПОПЕРЕДЖЕННЯ: Не вдалося визначити розміри входу моделі з форми {model_input_shape}. Масштабування рамок може бути неточним.")
-            model_input_height, model_input_width = target_height, target_width  # Резервний варіант
 
-        print(f"Запуск розпізнавання символів TFLite ({num_runs} разів)...")
-        for i in range(num_runs):
-            start_time = time.perf_counter()
-            interpreter.set_tensor(input_details[0]['index'], input_tensor)
-            interpreter.invoke()
-            # Припускаємо, що output_details[0] - це основний вихід з детекціями
-            # Форма вихідного тензора може бути [1, N, 6] (x1,y1,x2,y2, conf, cls_id)
-            # або [1, num_predictions, num_attributes] (наприклад, [1, 8400, 40] для YOLO)
-            # Це залежить від того, як була експортована TFLite модель (з NMS чи без)
-            raw_detections = interpreter.get_tensor(output_details[0]['index'])
-            end_time = time.perf_counter()
-            inference_times.append(end_time - start_time)
-
-            if i == num_runs - 1:  # Обробляємо детально тільки останній запуск
-                detected_characters_info = []
-
-                # Обробка вихідних даних - ЦЕЙ БЛОК ПОТРІБНО АДАПТУВАТИ ПІД ВАШУ МОДЕЛЬ TFLITE
-                # Варіант 1: Якщо вихід [1, N, 6] де N - кількість детекцій,
-                # а 6 -> [x1, y1, x2, y2, confidence, class_id]
-                # І координати нормалізовані до [0,1] відносно розміру входу моделі
-                if raw_detections.shape[2] == 6 and len(raw_detections.shape) == 3:  # Приклад для [1, N, 6]
-                    detections = raw_detections[0]  # Беремо перший (і єдиний) батч
-                    for detection in detections:
-                        x1, y1, x2, y2, confidence, cls_id_float = detection
-                        if confidence >= CONFIDENCE_THRESHOLD:
-                            cls_id = int(cls_id_float)
-                            character_str = "UNK"
-                            if cls_id < len(class_names):
-                                character_str = class_names[cls_id]
-                            else:
-                                print(f"ПОПЕРЕДЖЕННЯ: Не знайдено ім'я для класу ID {cls_id}. Використано 'UNK'.")
-
-                            # Денормалізація координат та отримання центру X
-                            # Якщо координати з TFLite нормалізовані до розміру входу моделі (model_input_width)
-                            abs_x1 = x1 * original_width / model_input_width
-                            abs_x2 = x2 * original_width / model_input_width
-                            x_center = (abs_x1 + abs_x2) / 2.0
-                            # Або якщо вони вже в абсолютних координатах відносно входу моделі:
-                            # x_center = ((x1 + x2) / 2.0) * (original_width / model_input_width)
-
-                            detected_characters_info.append({
-                                "x": x_center,  # Використовуємо масштабований x_center
-                                "char": character_str,
-                                "conf": confidence
-                            })
-                # Варіант 2: Якщо вихід [1, num_attributes, num_predictions] як у YOLO (напр. [1,40,8400])
-                # Цей варіант потребує складнішої обробки: декодування рамок, NMS.
-                # Для прикладу, припустимо, що Ваша TFLite модель має вбудований NMS
-                # і вихідний формат простий, як у Варіанті 1.
-                # Якщо ні, цей блок потрібно буде значно переписати.
-                # Див. документацію експорту Ultralytics для формату виходу TFLite.
-
-                else:
-                    print(f"ПОПЕРЕДЖЕННЯ: Невідомий або непідтримуваний формат виходу TFLite: {raw_detections.shape}")
-
-                detected_characters_info.sort(key=lambda item: item["x"])
-                recognized_plate_string_last_run = "".join([item["char"] for item in detected_characters_info])
-                char_confidences = [item["conf"] for item in detected_characters_info]
-
-                if char_confidences:
-                    avg_char_confidence_last_run = np.mean(char_confidences)
-                    char_details_last_run = [f"{item['char']}({item['conf']:.2f})" for item in detected_characters_info]
-
-        avg_inference_time = np.mean(inference_times)
-        print(f"\nРезультати для {model_name}:")
-        print(f"  Середній час розпізнавання TFLite: {avg_inference_time:.4f} секунд")
-
-        if recognized_plate_string_last_run != "НЕ РОЗПІЗНАНО" and char_details_last_run:
-            print(f"  Розпізнаний номерний знак (останній запуск): '{recognized_plate_string_last_run}'")
-            print(f"  Середня впевненість символів (останній запуск): {avg_char_confidence_last_run:.4f}")
-        else:
-            print(f"  Символи не були розпізнані (поріг: {CONFIDENCE_THRESHOLD}).")
-
-    except Exception as e:
-        print(f"Помилка під час розпізнавання моделлю TFLite {model_path}: {e}")
-        import traceback
-        traceback.print_exc()
+# -------------------------------- Main ---------------------------------------
 
 
 if __name__ == "__main__":
-    # Завантажуємо імена класів один раз з .pt моделі
-    # Це потрібно, оскільки TFLite моделі зазвичай не зберігають імена класів.
-    class_names_list = []
-    try:
-        pt_model_for_names = YOLO(MODEL_PT_PATH)
-        if hasattr(pt_model_for_names, 'names') and pt_model_for_names.names:
-            class_names_list = pt_model_for_names.names
-            print(f"Імена класів завантажено з {MODEL_PT_PATH}: {class_names_list}")
+    args = parse_args()
+    if not args.model_paths:
+        sys.exit("Не вказано жодної моделі (--model).")
+
+    # Перевірка файлів
+    for p in args.model_paths + [args.image]:
+        if not os.path.exists(p):
+            sys.exit(f"Файл не знайдено: {p}")
+
+    # Головне зображення
+    img = cv2.imread(args.image)
+    if img is None:
+        sys.exit(f"Не вдалося відкрити зображення {args.image}")
+
+    # Імена класів (обов’язково) — беремо з першої *.pt
+    pt_files = [p for p in args.model_paths if p.lower().endswith(".pt")]
+    if not pt_files:
+        sys.exit("Потрібен хоча б один .pt для завантаження імен класів.")
+    names = load_class_names(pt_files[0])
+
+    #   ­— Запуск кожної моделі —
+    print("\n===========  РЕЗУЛЬТАТИ  ===========")
+    for mp in args.model_paths:
+        ext = os.path.splitext(mp)[1].lower()
+        if ext in (".pt", ".onnx"):
+            plate, conf, tm = run_pt_or_onnx(
+                mp, img, names, args.conf, args.runs
+            )
+        elif ext == ".tflite":
+            plate, conf, tm = run_tflite(
+                mp, img, names, args.conf, args.runs
+            )
         else:
-            print(f"ПОМИЛКА: Не вдалося завантажити імена класів з {MODEL_PT_PATH}. Перевірте модель.")
-            # Якщо імена класів відомі, можна їх задати вручну:
-            # class_names_list = ['0', '1', '2', ..., 'X', 'Y', 'Z'] # Приклад
-    except Exception as e:
-        print(f"ПОМИЛКА при завантаженні імен класів з {MODEL_PT_PATH}: {e}")
-        print("Будь ласка, переконайтеся, що MODEL_PT_PATH правильний або задайте class_names_list вручну.")
+            print(f"[{mp}] ‒ Пропущено: невідомий формат")
+            continue
 
-    run_ocr_via_detection_test(MODEL_PT_PATH, IMAGE_PATH, "PyTorch (.pt)")
-    run_ocr_via_detection_test(MODEL_ONNX_PATH, IMAGE_PATH, "ONNX (.onnx)")
-
-    # Тестування .tflite (INT8) моделі
-    if class_names_list:  # Запускаємо тест TFLite тільки якщо є імена класів
-        run_tflite_ocr_test(MODEL_TFLITE_INT8_PATH, IMAGE_PATH, "TFLite INT8", class_names_list)
-    else:
-        print(f"\nТестування TFLite моделі ({MODEL_TFLITE_INT8_PATH}) пропущено через відсутність імен класів.")
-
-    print("\n--- Тестування завершено ---")
+        print(
+            f"[{os.path.basename(mp):>12}]  "
+            f"Plate: {plate:<15}  "
+            f"Avg conf: {conf:.3f}  "
+            f"Time: {tm*1000:.1f} ms"
+        )
+    print("====================================\n")
